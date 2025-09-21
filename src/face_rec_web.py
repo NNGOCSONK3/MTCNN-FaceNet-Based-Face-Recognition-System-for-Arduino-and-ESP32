@@ -1,16 +1,17 @@
+# -*- coding: utf-8 -*-
 """
 Face recognition + ESP32 TCP control + Flask MJPEG web + robust auto-discovery.
 
 Endpoints:
-- /               : UI xem video + LED + Cửa (Servo) + Telemetry
-- /video_feed     : MJPEG stream
-- /status         : trạng thái kết nối ESP
-- /telemetry      : JSON cảm biến/ACK mới nhất
-- /logo           : trả về /src/images/Logo.png
+- /                 : UI mobile (Logo + trạng thái + F5 + Cam + LED1/2/3 + Door + Fan + DHT11)
+- /video_feed       : MJPEG stream
+- /status           : trạng thái kết nối ESP
+- /telemetry        : JSON cảm biến/ACK mới nhất
+- /logo             : trả về /src/images/Logo.png
 
 Auto-discovery:
 - Nếu --esp32_ip=auto: quét subnet /24, ưu tiên ARP; chỉ nhận thiết bị gửi '{"hello":"esp32"}'.
-- Không hiển thị nút START; nhưng tự động gửi 'start' khi vừa kết nối thành công.
+- Không hiển thị nút START; nhưng tự động gửi 'start' đúng 1 lần khi vừa kết nối thành công.
 """
 
 import os
@@ -29,7 +30,7 @@ import cv2
 import imutils
 from imutils.video import VideoStream
 
-# TensorFlow v1 style (dùng facenet + MTCNN)
+# TensorFlow v1 style (facenet + MTCNN)
 import tensorflow as tf
 import facenet
 from align import detect_face as detect_face
@@ -38,10 +39,10 @@ from sklearn.svm import SVC
 from flask import Flask, Response, make_response, jsonify, request, send_file
 from flask_cors import CORS
 
-# ---- Cờ tự động gửi 'start' khi kết nối ESP thành công
-AUTO_START_ON_CONNECT = True
+# ================= Global flags =================
+AUTO_START_ON_CONNECT = True  # Gửi "start" một lần sau khi kết nối ESP
 
-# -------------------- Flask & stream --------------------
+# ================= Flask & stream =================
 app = Flask(__name__)
 CORS(app)
 
@@ -62,7 +63,8 @@ def _mjpeg_generator():
         with _frame_lock:
             buf = _latest_jpeg
         if buf is None:
-            time.sleep(0.02)
+            time.sleep(0.03)
+            yield boundary + b'\r\nContent-Type: image/jpeg\r\n\r\n' + b'' + b'\r\n'
             continue
         yield boundary + b'\r\nContent-Type: image/jpeg\r\n\r\n' + buf + b'\r\n'
 
@@ -70,7 +72,7 @@ def _mjpeg_generator():
 def video_feed():
     return Response(_mjpeg_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# -------------------- ESP state & telemetry --------------------
+# ================= ESP state & telemetry =================
 _esp = {"sock": None, "connected": False, "ip": "", "port": 0, "last_error": ""}
 _esp_lock = threading.Lock()
 
@@ -96,11 +98,10 @@ def telemetry():
             out["ack"] = _last_ack
         return jsonify(out)
 
-# ---- Logo route ----
 @app.route('/logo')
 def logo():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    logo_path = os.path.join(base_dir, 'src', 'images', 'Logo.png')
+    logo_path = os.path.join(base_dir, 'src', 'images', 'logo_mobile.png')
     if os.path.exists(logo_path):
         return send_file(logo_path, mimetype='image/png')
     return Response(status=404)
@@ -109,7 +110,7 @@ def _set_esp_state(sock, connected, ip, port, last_error=""):
     with _esp_lock:
         _esp.update({"sock": sock, "connected": connected, "ip": ip or "", "port": port, "last_error": last_error})
 
-# -------------------- GỬI LỆNH (tập trung) --------------------
+# ================= Unified send =================
 def send_to_esp_raw(cmd: str):
     """Gửi chuỗi lệnh thô tới ESP qua TCP (tự thêm newline)."""
     if not cmd.endswith("\n"):
@@ -125,22 +126,39 @@ def send_to_esp_raw(cmd: str):
             return False, f"socket error: {e}"
     return False, "esp not connected"
 
-def send_command(kind: str, value=None):
+def send_command(kind: str, value=None, index: int = None):
     """
     Hỗ trợ:
-      - led:on/off
-      - servo:<angle>
-      - door:open / door:close (gửi qua servo 0/180)
-      - start (giữ tương thích)
-      - ping
-      - raw:<string>
+      - light id=1..3, value in {on,off}  -> "light1:on"
+      - fan on/off                        -> "fan:on/off"
+      - door open/close                   -> "door:open/close"
+      - servo:<angle>                     -> "servo:0..180" (tương thích)
+      - start                             -> "start" (một lần khi connect hoặc face-rec)
+      - ping                              -> "ping"
+      - raw:<string>                      -> gửi nguyên văn
+      - led on/off                        -> alias light1 on/off
     """
     kind = (kind or "").lower().strip()
 
-    if kind == "led":
+    if kind == "light":
+        if index not in (1,2,3):
+            return False, "invalid light index"
         state = str(value).lower()
-        if state not in ("on", "off"): return False, "invalid led state"
-        return send_to_esp_raw(f"led:{state}")
+        if state not in ("on","off"):
+            return False, "invalid light state"
+        return send_to_esp_raw(f"light{index}:{state}")
+
+    if kind == "fan":
+        state = str(value).lower()
+        if state not in ("on","off"):
+            return False, "invalid fan state"
+        return send_to_esp_raw(f"fan:{state}")
+
+    if kind == "door":
+        state = str(value).lower()
+        if state not in ("open","close"):
+            return False, "invalid door state"
+        return send_to_esp_raw(f"door:{state}")
 
     if kind == "servo":
         try:
@@ -150,11 +168,11 @@ def send_command(kind: str, value=None):
         angle = max(0, min(180, angle))
         return send_to_esp_raw(f"servo:{angle}")
 
-    if kind == "door":
+    if kind == "led":
         state = str(value).lower()
-        if state == "open":  return send_to_esp_raw("door:open")
-        if state == "close": return send_to_esp_raw("door:close")
-        return False, "invalid door state"
+        if state not in ("on","off"):
+            return False, "invalid led state"
+        return send_to_esp_raw(f"light1:{state}")
 
     if kind == "start":
         return send_to_esp_raw("start")
@@ -169,28 +187,64 @@ def send_command(kind: str, value=None):
 
     return False, "unknown command"
 
-# -------------------- API (chỉ LED & SERVO/DOOR) --------------------
+# ================= APIs =================
+def _json_bad(msg): return ({"ok": False, "msg": msg}, 400)
+
+@app.route('/api/light1', methods=['POST'])
+def api_light1():
+    state = str((request.get_json(silent=True) or {}).get("state","")).lower()
+    if state not in ("on","off"): return _json_bad("state must be on/off")
+    ok, msg = send_command("light", state, 1)
+    return ({"ok": ok, "msg": msg}, 200 if ok else 503)
+
+@app.route('/api/light2', methods=['POST'])
+def api_light2():
+    state = str((request.get_json(silent=True) or {}).get("state","")).lower()
+    if state not in ("on","off"): return _json_bad("state must be on/off")
+    ok, msg = send_command("light", state, 2)
+    return ({"ok": ok, "msg": msg}, 200 if ok else 503)
+
+@app.route('/api/light3', methods=['POST'])
+def api_light3():
+    state = str((request.get_json(silent=True) or {}).get("state","")).lower()
+    if state not in ("on","off"): return _json_bad("state must be on/off")
+    ok, msg = send_command("light", state, 3)
+    return ({"ok": ok, "msg": msg}, 200 if ok else 503)
+
+@app.route('/api/door', methods=['POST'])
+def api_door():
+    state = str((request.get_json(silent=True) or {}).get("state","")).lower()
+    if state not in ("open","close"): return _json_bad("state must be open/close")
+    ok, msg = send_command("door", state)
+    return ({"ok": ok, "msg": msg}, 200 if ok else 503)
+
+@app.route('/api/fan', methods=['POST'])
+def api_fan():
+    state = str((request.get_json(silent=True) or {}).get("state","")).lower()
+    if state not in ("on","off"): return _json_bad("state must be on/off")
+    ok, msg = send_command("fan", state)
+    return ({"ok": ok, "msg": msg}, 200 if ok else 503)
+
+# Tương thích cũ:
 @app.route('/api/led', methods=['POST'])
 def api_led():
-    state = str((request.get_json(silent=True) or {}).get("state", "on")).lower()
-    if state not in ("on", "off"):
-        return ({"ok": False, "msg": "state must be on/off"}, 400)
+    state = str((request.get_json(silent=True) or {}).get("state","")).lower()
+    if state not in ("on","off"): return _json_bad("state must be on/off")
     ok, msg = send_command("led", state)
-    return ({"ok": ok, "msg": msg, "state": state}, 200 if ok else 503)
+    return ({"ok": ok, "msg": msg}, 200 if ok else 503)
 
 @app.route('/api/servo', methods=['POST'])
 def api_servo():
     data = request.get_json(silent=True) or {}
-    angle = data.get("angle", 90)
     try:
-        angle = int(angle)
+        angle = int(data.get("angle", 90))
     except Exception:
         angle = 90
     angle = max(0, min(180, angle))
     ok, msg = send_command("servo", angle)
     return ({"ok": ok, "msg": msg, "angle": angle}, 200 if ok else 503)
 
-# -------------------- Helper: LAN IP & Flask start --------------------
+# ================= Helper: LAN IP & Flask start =================
 def _get_local_ip():
     ip = "127.0.0.1"
     try:
@@ -209,7 +263,7 @@ def start_flask_server():
     print(f"  • Thiết bị khác:  http://{lan_ip}:5000/")
     app.run(host='0.0.0.0', port=5000, threaded=True)
 
-# -------------------- Discovery (xác thực hello) --------------------
+# ================= Discovery =================
 HELLO_SIGNATURE = '"hello":"esp32"'
 
 def _cidr_hosts(base_ip):
@@ -235,7 +289,7 @@ def _arp_candidates(subnet_prefix):
             res.append(x); seen.add(x)
     return res
 
-def _probe_esp(ip, port, timeout=0.4):
+def _probe_esp(ip, port, timeout=0.45):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -249,11 +303,13 @@ def _probe_esp(ip, port, timeout=0.4):
         s.close()
         return (HELLO_SIGNATURE in txt)
     except Exception:
-        try: s.close()
-        except: pass
+        try:
+            s.close()
+        except:
+            pass
         return False
 
-def discover_esp_ip(port=8088, timeout_per_host=0.4, max_workers=64):
+def discover_esp_ip(port=8088, timeout_per_host=0.45, max_workers=64):
     local_ip = _get_local_ip()
     parts = local_ip.split(".")
     if len(parts) != 4:
@@ -280,11 +336,13 @@ def discover_esp_ip(port=8088, timeout_per_host=0.4, max_workers=64):
     print("[DISCOVERY] Chưa tìm thấy ESP trong subnet.")
     return None
 
-# -------------------- Kết nối ESP --------------------
+# ================= ESP reconnect & telemetry =================
 _target_lock = threading.Lock()
 _target = {"ip": None, "port": 8088}
+_sent_start_after_connect = False
 
 def esp_reconnector(target_ref, interval=8):
+    global _sent_start_after_connect
     while True:
         with _esp_lock:
             ok = _esp["connected"]
@@ -314,12 +372,14 @@ def esp_reconnector(target_ref, interval=8):
                 s.settimeout(None)
                 print(f"[ESP] Kết nối thành công {ip}:{port}")
                 _set_esp_state(s, True, ip, port, "")
+                _sent_start_after_connect = False  # reset cờ cho lần kết nối mới
 
-                # Auto-START ngay sau khi kết nối
-                if AUTO_START_ON_CONNECT:
+                # Auto-START đúng 1 lần sau khi kết nối
+                if AUTO_START_ON_CONNECT and not _sent_start_after_connect:
                     ok2, msg2 = send_command("start")
                     if ok2:
                         print("[ESP] Auto-START đã gửi sau khi kết nối.")
+                        _sent_start_after_connect = True
                     else:
                         print("[ESP] Auto-START lỗi:", msg2)
 
@@ -357,6 +417,7 @@ def telemetry_reader():
                         else:
                             _last_telemetry.update(data)
                 except Exception:
+                    # bỏ qua dòng không phải JSON
                     pass
         except socket.timeout:
             pass
@@ -380,8 +441,8 @@ def rediscover_loop():
                 _set_esp_state(None, False, ip_found, port, "Chưa kết nối")
         time.sleep(8)
 
-# -------------------- UI (nền trắng, logo, không có nút START) --------------------
-HTML_TEMPLATE = """
+# ================= UI (mobile-like) =================
+HTML_TEMPLATE = r"""
 <!doctype html><html lang="vi">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -389,103 +450,133 @@ HTML_TEMPLATE = """
 <style>
 :root{color-scheme:light}
 *{box-sizing:border-box}
-body{margin:0;background:#ffffff;color:#111;font-family:system-ui,Segoe UI,Roboto;line-height:1.45}
-.wrap{min-height:100vh;display:flex;flex-direction:column;gap:16px;align-items:center;justify-content:flex-start;padding:16px}
-.header{width:min(100%,1000px);display:flex;align-items:center;gap:12px}
-.header img{height:46px;width:auto}
-.status{margin-left:auto;padding:10px 14px;border-radius:10px;border:1px solid #e5e7eb;background:#fafafa;font-size:clamp(12px,2.8vw,14px);word-break:break-word}
+html,body{height:100%;margin:0;overflow:hidden}
+body{font-family:system-ui,Segoe UI,Roboto;background:#fff;color:#111}
+.app{display:flex;flex-direction:column;gap:10px;height:100vh;padding:10px}
+
+/* Logo trên cùng, chiếm riêng 1 hàng */
+.logoTop{display:flex;justify-content:center;align-items:center}
+.logoTop img{height:46px;width:auto}
+
+/* Thanh trạng thái đặt DƯỚI logo, gọn nhẹ */
+.statusBar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center}
+.badge{justify-self:start;padding:6px 10px;border:1px solid #e5e7eb;border-radius:999px;background:#fafafa;font-size:13px;white-space:nowrap}
 .ok{background:#e8f7ef;border-color:#b7e3c7;color:#066a36}
 .warn{background:#fff3f3;border-color:#ffd6d6;color:#991b1b}
-.media{width:min(100%,1000px)}
-.media img{width:100%;height:auto;max-height:66vh;object-fit:contain;border-radius:12px;border:1px solid #e5e7eb;background:#fff}
-.panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;width:min(100%,1000px)}
-.card{border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;background:#ffffff}
-.card h3{margin:0 0 8px 0;font-size:clamp(15px,3.5vw,16px);color:#111}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button,input{padding:10px 12px;border-radius:10px;border:1px solid #d1d5db;background:#f3f4f6;color:#111;font-size:clamp(13px,3.5vw,14px)}
-button:active{transform:scale(0.98)}
-.kv{display:grid;grid-template-columns:120px 1fr;gap:6px 10px;font-size:clamp(12px,3.2vw,14px)}
-.value{font-weight:700}.hint{opacity:.8;font-size:clamp(12px,3.2vw,13px)}
-.note{width:min(100%,1000px)}
-code{background:#f3f4f6;padding:2px 6px;border-radius:6px;word-break:break-all;border:1px solid #e5e7eb}
-@media (max-width:600px){
-  .kv{grid-template-columns:100px 1fr}
-  .row > *{flex:1}
-  button{width:48%}
-  .header{flex-direction:column;align-items:flex-start;gap:8px}
-  .status{margin-left:0;width:100%}
-}
+.refresh{justify-self:end;padding:6px 10px;border:1px solid #e5e7eb;border-radius:10px;background:#f3f4f6;font-size:13px}
+
+/* Phần còn lại giữ nguyên bố cục */
+.main{display:grid;grid-template-rows:auto auto 1fr;gap:10px;min-height:0}
+.cam{min-height:0}
+.cam img{width:100%;height:44vh;object-fit:contain;border:1px solid #e5e7eb;border-radius:12px;background:#fff}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.tile{border:1px solid #e5e7eb;border-radius:12px;background:#fff;padding:10px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.tile h4{margin:0 0 2px 0;font-size:14px;color:#111}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.btn{flex:1;padding:10px 12px;border:1px solid #d1d5db;border-radius:10px;background:#f3f4f6;font-size:14px}
+.btn:active{transform:scale(0.98)}
+.hint{font-size:12px;opacity:.85}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:14px}
+.value{font-weight:700}
+*::-webkit-scrollbar{display:none}
+*{scrollbar-width:none}
+@media (max-width:640px){.cam img{height:42vh}.btn{font-size:13px}}
 </style>
-<div class="wrap">
-  <div class="header">
+
+<div class="app">
+  <!-- LOGO trên cùng -->
+  <div class="logoTop">
     <img src="/logo" alt="Logo" onerror="this.style.display='none'">
-    <div class="status warn" id="esp">Đang kiểm tra kết nối ESP32...</div>
   </div>
 
-  <div class="media"><img src="/video_feed" alt="Live video"></div>
+  <!-- Thanh trạng thái ESP + nút F5 đặt dưới logo -->
+  <div class="statusBar">
+    <div id="esp" class="badge warn">Đang chờ kết nối</div>
+    <div></div>
+    <button class="refresh" onclick="location.reload()">Làm mới</button>
+  </div>
 
-  <div class="panel">
-    <div class="card"><h3>Đèn LED</h3>
-      <div class="row">
-        <button onclick="led('on')">Bật LED</button>
-        <button onclick="led('off')">Tắt LED</button>
+  <div class="main">
+    <div class="cam"><img src="/video_feed" alt="Camera"></div>
+
+    <!-- Hàng 1: LED 1/2/3 -->
+    <div class="grid3">
+      <div class="tile">
+        <h4>LED 1</h4>
+        <div class="row">
+          <button class="btn" onclick="light(1,'on')">Bật</button>
+          <button class="btn" onclick="light(1,'off')">Tắt</button>
+        </div>
+        <div id="m_led1" class="hint"></div>
       </div>
-      <div id="led_msg" class="hint"></div>
+      <div class="tile">
+        <h4>LED 2</h4>
+        <div class="row">
+          <button class="btn" onclick="light(2,'on')">Bật</button>
+          <button class="btn" onclick="light(2,'off')">Tắt</button>
+        </div>
+        <div id="m_led2" class="hint"></div>
+      </div>
+      <div class="tile">
+        <h4>LED 3</h4>
+        <div class="row">
+          <button class="btn" onclick="light(3,'on')">Bật</button>
+          <button class="btn" onclick="light(3,'off')">Tắt</button>
+        </div>
+        <div id="m_led3" class="hint"></div>
+      </div>
     </div>
 
-    <div class="card"><h3>Cửa (Servo)</h3>
-      <div class="row">
-        <button onclick="servo_move(0)">Đóng cửa (0°)</button>
-        <button onclick="servo_move(180)">Mở cửa (180°)</button>
+    <!-- Hàng 2: Door / Fan / DHT11 -->
+    <div class="grid3">
+      <div class="tile">
+        <h4>Cửa</h4>
+        <div class="row">
+          <button class="btn" onclick="door('open')">Mở</button>
+          <button class="btn" onclick="door('close')">Đóng</button>
+        </div>
+        <div id="m_door" class="hint"></div>
       </div>
-      <div id="servo_msg" class="hint"></div>
-    </div>
-
-    <div class="card"><h3>Cảm biến</h3>
-      <div class="kv">
-        <div>Nhiệt độ</div><div><span id="temp" class="value">—</span> °C</div>
-        <div>Độ ẩm</div><div><span id="hum" class="value">—</span> %</div>
-        <div>Gas (raw)</div><div><span id="gas_raw" class="value">—</span></div>
-        <div>Gas (V)</div><div><span id="gas_v" class="value">—</span> V</div>
-        <div>RSSI</div><div><span id="rssi" class="value">—</span> dBm</div>
-        <div>Uptime</div><div><span id="uptime" class="value">—</span> s</div>
+      <div class="tile">
+        <h4>Quạt</h4>
+        <div class="row">
+          <button class="btn" onclick="fan('on')">Bật</button>
+          <button class="btn" onclick="fan('off')">Tắt</button>
+        </div>
+        <div id="m_fan" class="hint"></div>
+      </div>
+      <div class="tile">
+        <h4>DHT11</h4>
+        <div class="kv">
+            <div>Nhiệt độ</div><div>27°C</div>
+             <div>Độ ẩm</div><div>87%</div>
+        </div>
+        <div id="m_dht" class="hint"></div>
       </div>
     </div>
   </div>
-
-  <div class="note hint">Truy cập từ thiết bị khác trong cùng Wi-Fi: <code>http://&lt;IP-LAN-PC&gt;:5000/</code></div>
 </div>
 
 <script>
-async function led(state){
-  const r=await fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state})});
-  const j=await r.json(); led_msg.textContent=j.ok?'OK':'ERR: '+j.msg;
+function msg(id, text){const el=document.getElementById(id); if(el) el.textContent=text||'';}
+async function post(url, body){
+  const r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  try{ return await r.json(); }catch(e){ return {ok:false,msg:'bad json'} }
 }
-async function servo_move(deg){
-  const r=await fetch('/api/servo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({angle:deg})});
-  const j=await r.json(); servo_msg.textContent=j.ok?'OK':'ERR: '+j.msg;
-}
+async function light(i, state){const j=await post('/api/light'+i,{state}); msg('m_led'+i, j.ok?'OK':'ERR: '+(j.msg||''));}
+async function door(act){const j=await post('/api/door',{state:act}); msg('m_door', j.ok?'OK':'ERR: '+(j.msg||''));}
+async function fan(state){const j=await post('/api/fan',{state}); msg('m_fan', j.ok?'OK':'ERR: '+(j.msg||''));}
 async function poll(){
   try{
-    const r=await fetch('/status',{cache:'no-store'}); const st=await r.json();
+    const st=await (await fetch('/status',{cache:'no-store'})).json();
     const el=document.getElementById('esp');
-    el.className='status '+(st.esp_connected?'ok':'warn');
-    el.textContent=st.esp_connected?('ESP32 đã kết nối: '+st.ip+':'+st.port)
-      :('Đang chờ kết nối ESP32'
-        +(st.ip?' ('+st.ip+':'+st.port+')':'')
-        +(st.last_error?' — '+st.last_error:'')+'...');
+    el.className='badge '+(st.esp_connected?'ok':'warn');
+    el.textContent=st.esp_connected?'Đã kết nối':'Đang chờ kết nối';
   }catch(e){}
   try{
-    const t=await fetch('/telemetry',{cache:'no-store'});
-    if(t.ok){
-      const d=await t.json();
-      if('temp' in d)   temp.textContent=d.temp;
-      if('hum' in d)    hum.textContent =d.hum;
-      if('gas_raw' in d) gas_raw.textContent=d.gas_raw;
-      if('gas_v' in d)  gas_v.textContent=d.gas_v;
-      if('rssi' in d)   rssi.textContent=d.rssi;
-      if('uptime' in d) uptime.textContent=d.uptime;
-    }
+    const t=await (await fetch('/telemetry',{cache:'no-store'})).json();
+    if('temp'in t) document.getElementById('t_temp').textContent=t.temp;
+    if('hum' in t) document.getElementById('t_hum').textContent =t.hum;
   }catch(e){}
   setTimeout(poll,2000);
 }
@@ -500,16 +591,17 @@ def index():
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
-# -------------------- Main --------------------
+# ================= Main =================
 def main():
     global _jpeg_quality, _target
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path', default=0, help='Camera index or video path. Default camera 0.')
     parser.add_argument('--esp32_ip', default='auto', help="ESP32 IP address, hoặc 'auto' để tự dò")
     parser.add_argument('--esp32_port', type=int, default=8088)
-    parser.add_argument('--no-gui', action='store_true', help='Tắt cửa sổ OpenCV, chỉ dùng web')
+    parser.add_argument('--camera', default=0, help='Camera index hoặc đường dẫn video (mặc định 0)')
     parser.add_argument('--jpeg-quality', type=int, default=80)
+    parser.add_argument('--no-camera', action='store_true', help='Tắt camera/nhận diện, chỉ chạy web + ESP')
+    parser.add_argument('--no-gui', action='store_true', help='Không mở cửa sổ OpenCV; vẫn stream qua web')
     args = parser.parse_args()
     _jpeg_quality = int(np.clip(args.jpeg_quality, 1, 100))
 
@@ -519,14 +611,16 @@ def main():
     CLASSIFIER_PATH = os.path.join(MODELS_DIR, 'facemodel.pkl')
     FACENET_MODEL_PATH = os.path.join(MODELS_DIR, '20180402-114759.pb')
     ALIGN_DIR = os.path.join(BASE_DIR, 'src', 'align')
-    for f in ("det1.npy", "det2.npy", "det3.npy"):
-        if not os.path.exists(os.path.join(ALIGN_DIR, f)):
-            raise FileNotFoundError(f"Thiếu {f} tại {ALIGN_DIR}. Hãy đặt 3 file det*.npy vào đây.")
+    # Nếu không dùng camera, bỏ qua bước check model để dễ chạy nhanh
+    if not args.no_camera:
+        for f in ("det1.npy", "det2.npy", "det3.npy"):
+            if not os.path.exists(os.path.join(ALIGN_DIR, f)):
+                raise FileNotFoundError(f"Thiếu {f} tại {ALIGN_DIR}. Hãy đặt 3 file det*.npy vào đây.")
 
     # ==== Start web server ====
     threading.Thread(target=start_flask_server, daemon=True).start()
 
-    # ==== Auto-discovery / set target / threads ====
+    # ==== Auto-discovery / threads ====
     if args.esp32_ip == "auto":
         ip_found = discover_esp_ip(port=args.esp32_port)
         if ip_found:
@@ -542,6 +636,13 @@ def main():
     threading.Thread(target=rediscover_loop, daemon=True).start()
     threading.Thread(target=esp_reconnector, args=(_target,), daemon=True).start()
     threading.Thread(target=telemetry_reader, daemon=True).start()
+
+    # ==== Nếu tắt camera, chỉ giữ web + ESP ====
+    if args.no_camera:
+        print("[INFO] --no-camera: không chạy nhận diện/stream từ camera (trang web vẫn hoạt động).")
+        while True:
+            time.sleep(1)
+        # never returns
 
     # ==== Load classifier ====
     if not os.path.exists(CLASSIFIER_PATH):
@@ -566,7 +667,7 @@ def main():
 
             pnet, rnet, onet = detect_face.create_mtcnn(sess, ALIGN_DIR)
 
-            cap = VideoStream(src=args.path).start()
+            cap = VideoStream(src=args.camera).start()
             start_time = 0.0
             sent = False
 
@@ -577,23 +678,23 @@ def main():
                         time.sleep(0.01)
                         continue
 
-                    frame = imutils.resize(frame, width=600)
+                    frame = imutils.resize(frame, width=640)
                     frame = cv2.flip(frame, 1)
 
-                    boxes, _ = detect_face.detect_face(
-                        frame, 20, pnet, rnet, onet, [0.6, 0.7, 0.7], 0.709
-                    )
+                    boxes, _ = detect_face.detect_face(frame, 20, pnet, rnet, onet, [0.6, 0.7, 0.7], 0.709)
                     faces = boxes.shape[0] if boxes is not None else 0
 
                     try:
                         if faces > 0:
                             det = boxes[:, 0:4].astype(np.int32)
                             for i in range(faces):
+                                # bỏ qua khuôn mặt quá nhỏ
                                 if (det[i][3]-det[i][1]) / frame.shape[0] > 0.25:
                                     cropped = frame[det[i][1]:det[i][3], det[i][0]:det[i][2], :]
                                     scaled = cv2.resize(cropped, (160, 160), interpolation=cv2.INTER_CUBIC)
                                     scaled = facenet.prewhiten(scaled)
-                                    feed = {images_placeholder: scaled.reshape(-1, 160, 160, 3), phase_train_placeholder: False}
+                                    feed = {images_placeholder: scaled.reshape(-1, 160, 160, 3),
+                                            phase_train_placeholder: False}
                                     emb = sess.run(embeddings, feed_dict=feed)
 
                                     preds = model.predict_proba(emb)
@@ -601,21 +702,23 @@ def main():
                                     prob = float(preds[np.arange(len(idx)), idx][0])
                                     name = class_names[idx[0]]
 
-                                    if prob > 0.8:
-                                        cv2.rectangle(frame, (det[i][0], det[i][1]), (det[i][2], det[i][3]), (0, 255, 0), 2)
-                                        cv2.putText(frame, f"{name} {prob:.3f}", (det[i][0], max(det[i][1]-10, 20)),
-                                                    cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (255, 255, 255), 1)
+                                    # vẽ nhãn
+                                    cv2.rectangle(frame, (det[i][0], det[i][1]), (det[i][2], det[i][3]), (0, 255, 0), 2)
+                                    cv2.putText(frame, f"{name} {prob:.2f}",
+                                                (det[i][0], max(det[i][1]-10, 20)),
+                                                cv2.FONT_HERSHEY_COMPLEX, 0.6, (255,255,255), 1)
 
+                                    # Gửi "start" một lần nếu nhận diện đủ tin cậy liên tục >=2s
+                                    if prob > 0.8:
                                         if start_time == 0.0:
                                             start_time = time.time()
-                                        else:
-                                            if (time.time() - start_time) >= 2.0 and not sent:
-                                                ok, msg = send_command("start")
-                                                if ok:
-                                                    print("Đã gửi 'start' tới ESP32")
-                                                else:
-                                                    print("Không gửi được 'start':", msg)
-                                                sent = True
+                                        elif (time.time() - start_time) >= 2.0 and not sent:
+                                            ok, msg = send_command("start")
+                                            if ok:
+                                                print("Đã gửi 'start' tới ESP32")
+                                            else:
+                                                print("Không gửi được 'start':", msg)
+                                            sent = True
                                     else:
                                         start_time = 0.0
                                         sent = False
@@ -623,6 +726,7 @@ def main():
                             start_time = 0.0
                             sent = False
                     except Exception:
+                        # giữ ổn định vòng lặp dù lỗi nhỏ
                         pass
 
                     update_stream_frame(frame)
